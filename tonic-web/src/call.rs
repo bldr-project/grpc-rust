@@ -250,6 +250,9 @@ where
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         if self.client && self.direction == Direction::Decode {
             let mut me = self.as_mut();
+            // Whether the inner body has ended: a frame still incomplete
+            // then can never complete.
+            let mut ended = false;
 
             loop {
                 match ready!(me.as_mut().poll_decode(cx)) {
@@ -272,7 +275,7 @@ where
                         continue;
                     }
                     Some(Ok(_)) => unreachable!("unexpected frame type"),
-                    None => {} // No more data to decode, time to look for trailers
+                    None => ended = true, // No more data to decode, time to look for trailers
                     Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                 };
 
@@ -299,6 +302,9 @@ where
                         } else {
                             Poll::Ready(None)
                         }
+                    }
+                    FindTrailers::IncompleteBuf if ended => {
+                        Poll::Ready(Some(Err(internal_error("the body ended inside a frame"))))
                     }
                     FindTrailers::IncompleteBuf => continue,
                     FindTrailers::Done(len) => Poll::Ready(match len {
@@ -444,9 +450,11 @@ fn make_trailers_frame(trailers: HeaderMap) -> Vec<u8> {
 }
 
 /// Search some buffer for grpc-web trailers headers and return
-/// its location in the original buf. If `None` is returned we did
-/// not find a trailers in this buffer either because its incomplete
-/// or the buffer just contained grpc message frames.
+/// its location in the original buf. `Trailer` is returned only once the
+/// whole trailers frame is in the buffer: a frame cut by a chunk boundary
+/// is `IncompleteBuf`, so that its first part is not read as the whole
+/// trailers block and its rest as the next frame. `Done` means the buffer
+/// held grpc message frames only (and maybe the start of a frame header).
 fn find_trailers(buf: &[u8]) -> Result<FindTrailers, Status> {
     let mut len = 0;
     let mut temp_buf = buf;
@@ -461,6 +469,10 @@ fn find_trailers(buf: &[u8]) -> Result<FindTrailers, Status> {
         let header = temp_buf.get_u8();
 
         if header == GRPC_WEB_TRAILERS_BIT {
+            let trailers_len = temp_buf.get_u32() as usize;
+            if len + GRPC_HEADER_SIZE + trailers_len > buf.len() {
+                return Ok(FindTrailers::IncompleteBuf);
+            }
             return Ok(FindTrailers::Trailer(len));
         }
 
@@ -633,5 +645,59 @@ mod tests {
         expected.insert("b", "2".parse().unwrap());
 
         assert_eq!(trailers, expected);
+    }
+
+    #[test]
+    fn find_trailers_split_by_a_chunk_boundary_is_incomplete() {
+        let mut headers = HeaderMap::new();
+        headers.insert(Status::GRPC_STATUS, 0.into());
+        headers.insert(
+            Status::GRPC_MESSAGE,
+            "the whole message".try_into().unwrap(),
+        );
+        let trailers = make_trailers_frame(headers);
+
+        let mut buf = vec![0, 0, 0, 0, 3, 1, 2, 3];
+        buf.extend_from_slice(&trailers[..trailers.len() / 2]);
+        assert_eq!(find_trailers(&buf).unwrap(), FindTrailers::IncompleteBuf);
+
+        buf.extend_from_slice(&trailers[trailers.len() / 2..]);
+        assert_eq!(find_trailers(&buf).unwrap(), FindTrailers::Trailer(8));
+    }
+
+    #[tokio::test]
+    async fn a_response_whose_trailers_frame_arrives_in_two_chunks_decodes() {
+        use http_body_util::{BodyExt, StreamBody};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(Status::GRPC_STATUS, 0.into());
+        headers.insert(
+            Status::GRPC_MESSAGE,
+            "the whole message".try_into().unwrap(),
+        );
+        let trailers = make_trailers_frame(headers.clone());
+        let mut first = vec![0, 0, 0, 0, 3, 1, 2, 3];
+        first.extend_from_slice(&trailers[..7]);
+        let second = trailers[7..].to_vec();
+
+        let chunks = tokio_stream::iter(
+            [first, second].map(|c| Ok::<_, Status>(Frame::data(Bytes::from(c)))),
+        );
+        let body = GrpcWebCall::client_response(StreamBody::new(chunks));
+        let collected = body.collect().await.unwrap();
+        assert_eq!(collected.trailers(), Some(&headers));
+        assert_eq!(&collected.to_bytes()[..], &[0, 0, 0, 0, 3, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_ends_inside_a_frame_is_an_error() {
+        use http_body_util::{BodyExt, StreamBody};
+
+        let chunks = tokio_stream::iter([Ok::<_, Status>(Frame::data(Bytes::from(vec![
+            0, 0, 0, 0, 9, 1, 2,
+        ])))]);
+        let body = GrpcWebCall::client_response(StreamBody::new(chunks));
+        let err = body.collect().await.unwrap_err();
+        assert!(err.message().contains("ended inside a frame"), "{err}");
     }
 }
